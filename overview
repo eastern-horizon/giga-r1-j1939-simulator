@@ -1,0 +1,32 @@
+# Vehicle Simulator (Arduino GIGA) — Overview
+
+## What it is
+A bench-friendly simulator that mimics a heavy-duty vehicle: broadcasts **J1939 CAN**, exposes a **Web UI**, and persists **odometer/engine hours** across reboots.
+
+## What it does
+- Simulates core signals: speed, RPM, throttle, fuel, temps, voltage
+- VIN BAM + periodic engine/vehicle PGNs (61444, 65265, 65257, 65266, 65262, etc.)
+- Persistence: hourly (Δ ≥ 1h or 10 km; 10-min guard) and end-of-drive (IGN OFF after meaningful run)
+- Web UI for control + JSON telemetry; STA with AP fallback
+
+## Requirements
+**Hardware:** GIGA R1 + MCP2515 v2 (16 MHz) + 12 V supply  
+**Software:** Arduino IDE (GIGA core), ArduinoJson, WiFi (GIGA), mcp2515
+
+## Code layout
+1. **Persistence (KVStore)** — odometer tenths + engine hours; write throttling
+2. **Vehicle State** — speed/RPM/temps/fuel/voltage/ignition/cruise
+3. **Simulation Loop** — integrates speed → odometer; time → hours
+4. **CAN Broadcasts** — 20–1000 ms cadences; VIN at boot
+5. **Wi-Fi & Web** — STA connect → AP fallback; JSON + UI endpoints
+6. **Main Loop** — updates sim, sends CAN, calls persistence hooks
+
+## Usage flow
+1. Upload → Serial shows KV load & Wi-Fi info.
+2. Connect to device → open Web UI.
+3. Turn **Ignition On**, set speed or cruise → see hours & odometer rise.
+4. Turn **Ignition Off** after ≥2 min/≥1 km → see end-of-drive save.
+5. Reboot → values resume from last save.
+
+## Notes
+- If you allow manual edits of odometer/engine hours in the UI, gate them behind a toggle or only when ignition is OFF to avoid freezing the counters with repeated POSTs.
