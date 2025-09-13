@@ -1,0 +1,23 @@
+# Setup & Smoke Test
+
+## Install
+1. Arduino IDE → **Boards Manager** → Arduino **mbed_giga** (latest).
+2. Libraries: **ArduinoJson**, **WiFi** (GIGA), **mcp2515**.
+3. Place your sketch at `src/VehicleSimulator_GIGA.ino`.
+
+## Flash & First Boot
+- Upload → open Serial @115200.
+- Expect: `[KV] Loaded persistent values.`  
+- If STA fails, AP starts; Serial prints SSID/IP (often `192.168.3.1`).
+
+## Smoke Test
+1. Web UI: turn **Ignition On**.
+2. Set speed (or Cruise ON + Set Speed).
+3. Confirm **Engine Hours** and **Odometer** increase.
+4. Toggle ignition OFF after ≥2 min → expect `[KV] Saved (end-of-drive).`
+5. Reboot → values resume.
+
+## Troubleshooting
+- Hours not changing: ensure **Ignition On**.
+- Odo not changing: ensure **Speed > 0** (or Cruise active).
+- If UI posts keep resetting counters, disable odometer/engineHours writes from web POST or gate them behind a flag.
