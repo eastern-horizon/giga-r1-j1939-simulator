@@ -29,3 +29,12 @@ Stable vehicle simulator for **Arduino GIGA R1** with **J1939 CAN**, **Web UI**,
 4. Connect to the device (STA or AP) → open the **Web UI** → simulate a drive.
 
 More details: see `docs/OVERVIEW.md` and `docs/SETUP.md`.
+
+# Changelog
+
+## v1.00 — 2025-09-13
+- First stable baseline release
+- Web UI for controls (ignition, cruise, throttle, speed)
+- J1939 CAN broadcasts (VIN BAM, EEC1, CCVS, Engine Hours, Distance Legacy, Fuel, Temps, Voltage)
+- Basic odometer & engine hours counters
+
