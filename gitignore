@@ -1,0 +1,13 @@
+.DS_Store
+.vscode/
+.idea/
+*.zip
+*.log
+build/
+__pycache__/
+*.bin
+*.elf
+*.hex
+*.map
+*.d
+*.o
