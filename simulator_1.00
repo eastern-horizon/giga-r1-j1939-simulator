@@ -1,0 +1,1460 @@
+
+/*
+  === Vehicle Simulator for Arduino GIGA ===
+  Supports: CAN Bus (optional), Web Interface, Serial Monitor
+  Hardware: Arduino GIGA R1 + Seeed CAN-BUS Shield v2 (MCP2515)
+*/
+
+#include <SPI.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <mcp2515_can.h>
+#include <math.h>
+
+// ================== [1] WiFi Credentials ==================
+const char* staSSID = "your_wifi";  // ✅ Replace with your WiFi SSID
+const char* staPass = "";                              // ✅ Replace with your WiFi Password
+const char* apSSID  = "GIGA-Simulator";
+const char* apPass  = "12345678";
+
+// ================ CAN Network Setup =================
+#define ENGINE_ADDRESS 0x00        // ⚠️ Real ECM SA; may collide on a live bus. Consider 0xCA for a simulator.
+const uint8_t PRIORITY_BROADCAST = 6;
+#define CAN_SPEED CAN_250KBPS
+
+// ---- J1939 ID composer (PDU1/PDU2 aware) ----
+static inline uint32_t j1939Id(uint8_t priority, uint32_t pgn, uint8_t sa, int da /* -1 for PDU2 */) {
+  uint8_t pf = (pgn >> 8) & 0xFF;
+  if (pf < 240) { // PDU1: DA present, PGN low byte zero
+    uint32_t pgn_pdu1 = (pgn & 0x03FF00);
+    uint8_t dest = (da < 0) ? 0xFF : (uint8_t)da;
+    return ((uint32_t)priority << 26) | (pgn_pdu1 << 8) | ((uint32_t)dest << 8) | sa;
+  } else {        // PDU2: no DA
+    return ((uint32_t)priority << 26) | (pgn << 8) | sa;
+  }
+}
+
+// Helper for J1939 extended ID (now safe to call)
+uint32_t makeCANID(uint32_t pgn) { return j1939Id(PRIORITY_BROADCAST, pgn, ENGINE_ADDRESS, -1); }
+
+// ================ Global Variables =================
+WiFiServer wifiServer(80);
+
+// --- One CAN instance only ---
+#define SPI_CS_PIN 9
+mcp2515_can CAN(SPI_CS_PIN);  // Seeed CAN shield CS = D9
+
+// INT pin from shield (factory default is D2)
+const int CAN_INT_PIN = 2;    // Digital pin 2 (NOT A2)
+volatile bool canInterruptFlag = false;
+
+bool canReady = false;
+bool autoSimEnabled = true;      // Toggle for simulator auto-updating
+bool autoMPGEnabled = true;      // Toggle for automatic fuel/mpg calculation
+
+// Vehicle state
+bool keyOn = false;
+bool cruiseOn = false;
+bool cruiseActive = false;
+int  vehicleSpeed = 0;    // km/h
+int  vehicleRPM = 0;
+float fuelLevel = 100;
+int  throttle = 0;        // Throttle position (%)
+int  engineLoad = 0;
+int  coolantTemp = 190;   // °F
+int  engineTemp = 200;    // °F
+int  intakeTemp = 90;     // °F
+float batteryVoltage = 13.8;
+
+double odometer_km = 0.0;     // total distance (km)
+double engine_hours_h = 0.0;  // engine hours
+
+
+// ====== Fuel Tank Configuration ======
+const float fuelTankSizeLiters = 900.0;  // Example: 100 gal = 378.5 L
+float LitersRemaining = fuelTankSizeLiters;
+
+// Simulation metrics
+float odometer = 0.00; // km
+float engineHours = 0.00;
+int controlSource = 1;    // 0=hardware, 1=web
+int cruiseSetSpeed = 0;   // km/h
+int cruiseState = 0;      // 0=off, 1=standby, 2=active
+
+// Simulation variables
+float fuelRate = 0.0;      // L/h
+float instantMPG = 0.0;
+float averageMPG = 0.0;
+float tripFuel = 0.0;     // L
+String vin = "3AKJHPDV3NSMZ5468";
+
+// Timing
+unsigned long lastCANUpdateMillis = 0;
+unsigned long lastMetricsUpdateMillis = 0;
+unsigned long lastVINSendMillis = 0;
+unsigned long lastSpeedCheck = 0;
+float msToHours = 1.0 / 3600000.0;
+
+// ================ PGN Definitions =================
+#ifndef PGN_REQUEST
+#define PGN_REQUEST 0x00EA00
+#endif
+#ifndef PGN_TP_CM
+#define PGN_TP_CM 0x00EC00
+#endif
+#ifndef PGN_TP_DT
+#define PGN_TP_DT 0x00EB00
+#endif
+#ifndef PGN_ADDRESS_CLAIM
+#define PGN_ADDRESS_CLAIM 0x00EE00
+#endif
+
+// PGN definitions
+#define PGN_EEC1        0xF004
+#define PGN_CCVS        0xFEF1    // ✅ CCVS1 (wheel-based speed)
+#define PGN_VIN         0xFEEC
+#define PGN_FUEL_ECON   0xF00D
+#define PGN_ENGINE_TEMP 0xFEDC
+#define PGN_FUEL_LEVEL  0xFEDD
+#define PGN_EH          0xFEE5
+#define PGN_TVD_HR      0xFEC1    // ✅ High-Resolution Vehicle Distance
+#define PGN_VEH_DIST    0xFEE0    // ✅ Legacy Vehicle Distance
+
+
+// ================ Function Prototypes =================
+void connectWiFi();
+void printWiFiInfo();
+void setupJ1939();
+void sendJ1939_EEC1();
+void sendJ1939_CCVS();
+void sendJ1939_VIN();
+void updateCruiseControl();
+void updateTimeMetrics();
+void sendAddressClaim();
+void handleClient(WiFiClient client);
+void handleDataRequest(WiFiClient& client);
+void handleUpdateRequest(WiFiClient& client, String body);
+String buildHTML();
+
+
+
+// --- J1939 NAME builder (LSB-first in the CAN payload) ---
+static void buildNameBytes(
+  uint8_t out[8],
+  uint32_t identityNumber,   // 21 bits (0..0x1FFFFF)
+  uint16_t manufacturerCode, // 11 bits (0..0x07FF)
+  uint8_t  ecuInstance,      // 3 bits
+  uint8_t  functionInstance, // 5 bits
+  uint8_t  function,         // 8 bits (e.g., 0x33 = Engine; 0xFE = Simulator)
+  uint8_t  vehicleSystem,    // 7 bits
+  uint8_t  vehicleSysInst,   // 4 bits
+  uint8_t  industryGroup,    // 3 bits (1 = On-Highway)
+  bool     aac               // Arbitrary Address Capable
+) {
+  uint64_t name = 0;
+  name |= (uint64_t)(identityNumber   & 0x1FFFFF);           // bits 0..20
+  name |= (uint64_t)(manufacturerCode & 0x07FF) << 21;       // bits 21..31
+  name |= (uint64_t)(ecuInstance      & 0x07)   << 32;       // bits 32..34
+  name |= (uint64_t)(functionInstance & 0x1F)   << 35;       // bits 35..39
+  name |= (uint64_t)(function)                    << 40;     // bits 40..47
+  name |= (uint64_t)(vehicleSystem    & 0x7F)   << 48;       // bits 48..54
+  name |= (uint64_t)(vehicleSysInst   & 0x0F)   << 55;       // bits 55..58
+  name |= (uint64_t)(industryGroup    & 0x07)   << 59;       // bits 59..61
+  name |= (uint64_t)(aac ? 1ULL : 0ULL)         << 63;       // bit 63
+
+  for (int i = 0; i < 8; ++i) out[i] = (uint8_t)((name >> (8*i)) & 0xFF);
+}
+
+
+// ================ J1939 INITIALIZATION =================
+void setupJ1939() {
+  if (!canReady) return;
+  CAN.init_Mask(0, 1, 0x1FFFFFFF);
+  CAN.init_Mask(1, 1, 0x1FFFFFFF);
+}
+
+
+// ================ CAN MESSAGE FORMATTING =================
+void sendJ1939_EEC1() {
+  if (!canReady) return;
+
+  byte data[8];
+  for (byte i = 0; i < 8; i++) data[i] = 0xFF;
+
+  // SPN 190 Engine Speed (bytes 4–5), 0.125 rpm/bit
+  uint16_t rpm = vehicleRPM;
+  if (rpm > 8031) rpm = 8031;
+  uint16_t raw = (uint16_t)(rpm * 8);
+  data[3] = raw & 0xFF;        // byte 4 (LSB)
+  data[4] = (raw >> 8) & 0xFF; // byte 5 (MSB)
+
+  uint32_t canID = j1939Id(PRIORITY_BROADCAST, PGN_EEC1, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(canID, 1 /*ext*/, 8, data);
+}
+
+void sendJ1939_CCVS() {
+  if (!canReady) return;
+
+  byte data[8];
+  for (byte i = 0; i < 8; i++) data[i] = 0xFF;
+
+  // Byte 1: CC & brake status flags (SPN 595, 70, etc.)
+  // CC Active: Byte 1 bits 5..4 (00=Off, 01=Active)
+  bool ccActiveEffective = cruiseActive || (controlSource == 1 && cruiseOn && cruiseSetSpeed > 0);
+  data[0] = 0xFF;                  // start with all bits NA
+  data[0] &= ~(0b11 << 4);         // clear bits 5..4
+  data[0] |= (ccActiveEffective ? 0b01 : 0b00) << 4;
+
+  // Parking Brake: Byte 1 bits 1..0 (00=Released, 01=Applied)
+  bool parkingBrakeReleased = (vehicleSpeed > 1.0f);  // or from web/toggle
+  data[0] &= ~0b11;
+  data[0] |= (parkingBrakeReleased ? 0b00 : 0b01);
+
+  // Vehicle speed (SPN 84): Byte 2–3 = 1/256 km/h
+  float kmh = (float)vehicleSpeed;
+  if (kmh < 0) kmh = 0;
+  uint16_t raw = (uint16_t)(kmh * 256.0f + 0.5f);
+  data[1] = raw & 0xFF;           // LSB
+  data[2] = (raw >> 8) & 0xFF;    // MSB
+
+  // Remaining bytes (optional or NA)
+  data[3] = 0xFF;
+  data[4] = 0xFF;
+  data[5] = 0xFF;
+  data[6] = 0xFF;
+  data[7] = 0xFF;
+
+  uint32_t canID = j1939Id(PRIORITY_BROADCAST, PGN_CCVS, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(canID, 1 /*ext*/, 8, data);
+}
+
+
+  
+ 
+// ================ PGN 65253 - ENGINE HOURS =================
+// PGN 65253 (0xFEE5): Engine Hours, SPN 247, 0.05 h/bit, LSB first
+void sendJ1939_EH() {
+  if (!canReady) return;
+  uint32_t raw = (uint32_t)(engineHours / 0.05 + 0.5); // hours → counts
+  byte d[8] = {
+    (byte)(raw & 0xFF), (byte)((raw >> 8) & 0xFF),
+    (byte)((raw >> 16) & 0xFF), (byte)((raw >> 24) & 0xFF),
+    0xFF, 0xFF, 0xFF, 0xFF
+  };
+  uint32_t id = j1939Id(PRIORITY_BROADCAST, 0x00FEE5, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(id, 1, 8, d);
+
+
+  Serial.println("Sent J1939: Engine Hours (PGN 0xFEE5)");
+}
+
+// ================ PGN 65261 - FUEL LEVEL =================
+void sendJ1939_FUEL_LEVEL() {
+  if (!canReady) return;
+
+  byte data[8];
+  data[0] = fuelLevel * 2.0;  // SPN 96: 0.5% resolution
+  for (byte i = 1; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18FEDD00 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Fuel Level (PGN 0xFEDD)");
+}
+
+// ================ PGN 65244 - ENGINE TEMPERATURE =================
+void sendJ1939_ENGINE_TEMP() {
+  if (!canReady) return;
+
+   byte data[8];
+  // Inputs are °F in UI; convert to °C and add +40 offset for raw byte.
+  auto FtoC = [](int f){ return (int)round((f - 32) * 5.0 / 9.0); };
+    int cCoolant = FtoC(coolantTemp);
+   int cEngine  = FtoC(engineTemp);
+   int cIntake  = FtoC(intakeTemp);
+  // Raw = °C + 40, clamp to 0..250 (0xFA) per J1939
+  data[0] = (uint8_t)constrain(cCoolant + 40, 0, 250); // SPN 110
+  data[1] = (uint8_t)constrain(cEngine  + 40, 0, 250); // SPN 175
+  data[2] = (uint8_t)constrain(cIntake  + 40, 0, 250); // SPN 170
+
+
+  for (byte i = 3; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18FEDC00 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Engine Temperatures (PGN 0xFEDC)");
+}
+
+// ================ PGN 65262 - BATTERY VOLTAGE =================
+void sendJ1939_BATTERY_VOLTAGE() {
+  if (!canReady) return;
+
+  byte data[8];
+  uint16_t volts = batteryVoltage * 20.0;  // SPN 168: scale 0.05 V/bit
+  data[0] = volts & 0xFF;
+  data[1] = (volts >> 8) & 0xFF;
+
+  for (byte i = 2; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18FEEE00 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Battery Voltage (PGN 0xFEEE)");
+}
+
+// ================ PGN 61451 - FUEL ECONOMY =================
+void sendJ1939_FUEL_ECONOMY() {
+  if (!canReady) return;
+
+  byte data[8];
+
+  // SPN 183: Fuel Rate, scale = 0.05 L/h
+  uint16_t scaledFuelRate = fuelRate / 0.05;
+  data[0] = scaledFuelRate & 0xFF;
+  data[1] = (scaledFuelRate >> 8) & 0xFF;
+
+  // SPN 184: Instant Fuel Economy, scale = 0.001 km/L
+  uint16_t scaledMPG = (instantMPG * 0.42514) / 0.001;  // Convert MPG → km/L
+  data[2] = scaledMPG & 0xFF;
+  data[3] = (scaledMPG >> 8) & 0xFF;
+
+  for (byte i = 4; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18F00D00 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Fuel Economy (PGN 0xF00D)");
+}
+
+// ================ handleRequestPGN =================
+// Keep only ONE definition of handleRequestPGN – this one.
+void handleRequestPGN(uint32_t reqPGN, uint8_t da) {
+  if (!(da == 0xFF || da == ENGINE_ADDRESS)) return;
+
+  if (reqPGN == PGN_ADDRESS_CLAIM) {
+    sendAddressClaim();
+  } else if (reqPGN == PGN_VIN) {
+    if (vin.length() >= 17) startVIN_BAM(vin.c_str());
+  } else if (reqPGN == PGN_VEH_DIST) {    // Legacy Vehicle Distance (FEE0)
+      sendJ1939_VEHICLE_DISTANCE_LEGACY();
+ }  else if (reqPGN == PGN_TVD_HR) {      // High-Resolution Vehicle Distance (FEC1)
+     sendJ1939_TVD_HR();
+  } else if (reqPGN == PGN_EH) {          // Engine Hours
+    sendJ1939_EH();
+  }
+}
+
+
+// ==================== BEGIN NEW FUNCTIONS ====================
+
+
+
+void sendJ1939_ENGINE_PRESSURE() {
+  if (!canReady) return;
+
+  byte data[8];
+  uint16_t oilPressure = 400;     // SPN 100: 4.00 bar (0.01 scale)
+  uint16_t coolantPressure = 200; // SPN 109: 2.00 bar
+  uint8_t temp = (coolantTemp - 40); // SPN 110 offset 40
+
+  data[0] = oilPressure & 0xFF;
+  data[1] = (oilPressure >> 8) & 0xFF;
+  data[2] = coolantPressure & 0xFF;
+  data[3] = (coolantPressure >> 8) & 0xFF;
+  data[4] = temp;
+
+  for (byte i = 5; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18FEC300 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Engine Pressure (PGN 0xFEC3)");
+}
+
+void sendJ1939_TRANS_TEMP_PRESSURE() {
+  if (!canReady) return;
+
+  byte data[8];
+  uint8_t transTemp = 180 - 40;  // SPN 177: 140 raw = 180°F
+  uint16_t transPressure = 150; // SPN 127: 1.5 bar
+
+  data[0] = transTemp;
+  data[1] = transPressure & 0xFF;
+  data[2] = (transPressure >> 8) & 0xFF;
+
+  for (byte i = 3; i < 8; i++) data[i] = 0xFF;
+
+  CAN.sendMsgBuf(0x18FEC800 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Transmission Temp/Pressure (PGN 0xFEC8)");
+}
+
+void sendJ1939_DTC() {
+  if (!canReady) return;
+
+  byte data[8];
+
+  // Simulated DTC: SPN 102, FMI 1 (Above Normal)
+  uint32_t dtc = (102 << 11) | (1 & 0x1F);
+
+  data[0] = dtc & 0xFF;
+  data[1] = (dtc >> 8) & 0xFF;
+  data[2] = (dtc >> 16) & 0xFF;
+  data[3] = 0x00;  // OC/CM bits
+  data[4] = 0xFF;
+  data[5] = 0xFF;
+  data[6] = 0xFF;
+  data[7] = 0x01;  // One DTC present
+
+  CAN.sendMsgBuf(0x18FECA00 | ENGINE_ADDRESS, 1, 8, data);
+  Serial.println("Sent J1939: Active DTC (PGN 0xFECA)");
+}
+
+// ==================== PGN 65217 - ODOMETER ====================
+
+void sendJ1939_VEHICLE_DISTANCE_LEGACY() {
+  if (!canReady) return;
+
+  // Trip is optional in your sim; send 0xFFFFFFFF if not tracking it
+  uint32_t total_raw = (uint32_t)llroundf(odometer / 0.125f); // km * 8
+
+  uint8_t d[8] = {
+    0xFF,0xFF,0xFF,0xFF,                            // SPN 244 Trip (NA)
+    (uint8_t)(total_raw      & 0xFF),               // SPN 245 Total LSB
+    (uint8_t)((total_raw>>8) & 0xFF),
+    (uint8_t)((total_raw>>16)& 0xFF),
+    (uint8_t)((total_raw>>24)& 0xFF)
+  };
+
+  uint32_t id = j1939Id(PRIORITY_BROADCAST, PGN_VEH_DIST, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(id, 1, 8, d);
+}
+
+
+void sendJ1939_TVD_HR() {
+  if (!canReady) return;
+
+  uint32_t total_raw = (uint32_t)llroundf((odometer * 1000.0f) / 5.0f); // km -> m -> /5
+
+  uint8_t d[8] = {
+    (uint8_t)(total_raw      & 0xFF),               // SPN 917 Total LSB
+    (uint8_t)((total_raw>>8) & 0xFF),
+    (uint8_t)((total_raw>>16)& 0xFF),
+    (uint8_t)((total_raw>>24)& 0xFF),
+    0xFF,0xFF,0xFF,0xFF                               // SPN 918 Trip (NA)
+  };
+
+  uint32_t id = j1939Id(PRIORITY_BROADCAST, PGN_TVD_HR, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(id, 1, 8, d);
+}
+
+
+
+void sendJ1939_ODOMETER() {
+   // Provide both distance PGNs when explicitly asked
+   sendJ1939_VEHICLE_DISTANCE_LEGACY();
+   sendJ1939_TVD_HR();
+ }
+
+
+
+// ================ VIN TRANSPORT PROTOCOL =================
+void sendJ1939_VIN() {
+  if (!canReady) return;
+
+  const uint8_t VIN_LENGTH = 17;
+  uint8_t vinData[VIN_LENGTH];
+  for (uint8_t i = 0; i < VIN_LENGTH; i++) vinData[i] = vin[i] ? vin[i] : ' ';
+
+  // ---- CM_BAM (PGN 60416 / 0x00EC00), control 0x20 ----
+  uint8_t cm[8];
+  cm[0] = 0x20;                              // BAM
+  cm[1] = VIN_LENGTH & 0xFF;                 // total bytes LSB
+  cm[2] = (VIN_LENGTH >> 8) & 0xFF;          // total bytes MSB
+  cm[3] = (VIN_LENGTH + 6) / 7;              // total packets (ceil)
+  cm[4] = 7;                                 // bytes per DT packet
+  cm[5] = (uint8_t)(0xFEEC & 0xFF);          // Data PGN LSB (VIN)
+  cm[6] = (uint8_t)((0xFEEC >> 8) & 0xFF);   // Data PGN mid
+  cm[7] = (uint8_t)((0xFEEC >> 16) & 0xFF);  // Data PGN MSB
+
+  uint32_t idCM = j1939Id(PRIORITY_BROADCAST, 0x00EC00, ENGINE_ADDRESS, 0xFF); // TP.CM, global
+  CAN.sendMsgBuf(idCM, 1, 8, cm);
+
+  // ---- DT packets (PGN 60160 / 0x00EB00) ----
+  const uint8_t totalPackets = cm[3];
+  uint8_t dt[8];
+  uint8_t idx = 0;
+  for (uint8_t seq = 1; seq <= totalPackets; ++seq) {
+    dt[0] = seq;
+    for (uint8_t i = 1; i <= 7; ++i) {
+      dt[i] = (idx < VIN_LENGTH) ? vinData[idx++] : 0xFF;
+    }
+    uint32_t idDT = j1939Id(PRIORITY_BROADCAST, 0x00EB00, ENGINE_ADDRESS, 0xFF); // TP.DT, global
+    CAN.sendMsgBuf(idDT, 1, 8, dt);
+    delay(20); // conservative pacing (you can reduce later)
+  }
+
+  Serial.println("Sent J1939: VIN (PGN 0xFEEC) via BAM");
+}
+
+// ---------- TP.BAM state for VIN (PGN 65260) ----------
+struct BamState {
+  bool     active = false;
+  uint8_t  totalBytes = 0;
+  uint8_t  totalPackets = 0;   // ceil(totalBytes / 7)
+  uint8_t  nextSeq = 1;        // DT sequence number (1..N)
+  uint8_t  payload[32];        // VIN fits in 17 bytes; 32 gives headroom
+  uint8_t  payloadLen = 0;
+  uint32_t nextSendMs = 0;
+  uint16_t gapMs = 50;         // inter-DT frame gap
+} vinBam;
+
+
+void startVIN_BAM(const char* vin17) {
+  const uint8_t L = 17;
+  vinBam.payloadLen = L;
+  for (uint8_t i = 0; i < L; ++i) vinBam.payload[i] = (uint8_t)vin17[i];
+  vinBam.totalBytes   = L;
+  vinBam.totalPackets = (L + 6) / 7;
+
+  uint8_t cm[8];
+  cm[0] = 0x20;                         // BAM
+  cm[1] = vinBam.totalBytes & 0xFF;
+  cm[2] = vinBam.totalBytes >> 8;
+  cm[3] = vinBam.totalPackets;
+  cm[4] = 7;                            // bytes per DT
+  cm[5] = (uint8_t)(PGN_VIN & 0xFF);
+  cm[6] = (uint8_t)((PGN_VIN >> 8) & 0xFF);
+  cm[7] = (uint8_t)((PGN_VIN >> 16) & 0xFF);
+
+  uint32_t idCM = j1939Id(PRIORITY_BROADCAST, PGN_TP_CM, ENGINE_ADDRESS, 0xFF);
+  CAN.sendMsgBuf(idCM, 1, 8, cm);
+
+  vinBam.active   = true;
+  vinBam.nextSeq  = 1;
+  vinBam.nextSendMs = millis() + vinBam.gapMs;
+}
+
+
+void tickVIN_BAM() {
+  if (!vinBam.active) return;
+  uint32_t now = millis();
+  if (now < vinBam.nextSendMs) return;
+
+  uint8_t dt[8];
+  dt[0] = vinBam.nextSeq;
+  uint8_t offset = (vinBam.nextSeq - 1) * 7;
+  for (uint8_t i = 0; i < 7; ++i) {
+    uint8_t idx = offset + i;
+    dt[i + 1] = (idx < vinBam.payloadLen) ? vinBam.payload[idx] : 0xFF;
+  }
+
+  uint32_t idDT = j1939Id(PRIORITY_BROADCAST, PGN_TP_DT, ENGINE_ADDRESS, 0xFF);
+  CAN.sendMsgBuf(idDT, 1, 8, dt);
+
+  vinBam.nextSeq++;
+  if (vinBam.nextSeq > vinBam.totalPackets) {
+    vinBam.active = false;
+  } else {
+    vinBam.nextSendMs = now + vinBam.gapMs;
+  }
+}
+
+void sendAddressClaim();
+
+void processCANRx() {
+  while (CAN_MSGAVAIL == CAN.checkReceive()) {
+    byte len = 0;
+    byte buf[8];
+    CAN.readMsgBuf(&len, buf);                  // read frame
+    unsigned long rxId = CAN.getCanId();        // 29-bit ID
+
+    // Decompose 29-bit J1939 ID
+    uint8_t sa =  (uint8_t)(rxId        & 0xFF);
+    uint8_t ps =  (uint8_t)((rxId >> 8) & 0xFF);
+    uint8_t pf =  (uint8_t)((rxId >> 16) & 0xFF);
+    // uint8_t pr = (uint8_t)((rxId >> 26) & 0x07); // priority if needed
+
+    uint32_t pgn;
+    uint8_t da;
+    if (pf < 240) {                 // PDU1: DA present; PGN low byte = 0x00
+      pgn = ((uint32_t)pf << 8);
+      da  = ps;                     // Destination Address is PS
+    } else {                        // PDU2: Broadcast; PGN uses PS as group extension
+      pgn = ((uint32_t)pf << 8) | ps;
+      da  = 0xFF;                   // Global
+    }
+
+    // Optional debug
+    //Serial.printf("RX PGN=%06lX DA=%02X SA=%02X len=%u\n", pgn, da, sa, len);
+
+    // Handle Request (PGN 59904 / 0x00EA00) with 3-byte PGN in payload
+    if (pgn == (PGN_REQUEST & 0x03FFFF) && len >= 3) {
+      uint32_t req = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16);
+      handleRequestPGN(req, da);
+    }
+
+    // (Add other inbound PGNs here if needed)
+  }
+}
+
+
+// ================ CRUISE CONTROL LOGIC =================
+// ======= Cruise control (runs ~every 100 ms) =======
+// Tunables (per 100 ms tick):
+static const float CRUISE_KP       = 0.6f;   // throttle % per km/h of error (P-only)
+static const float CRUISE_DEADBAND = 1.0f;   // km/h; ignore tiny error to avoid hunting
+static const float ACCEL_GAIN      = 0.0020f;// km/h per tick per 1% throttle
+static const float DRAG_BASE       = 0.015f; // km/h per tick (rolling/aero)
+static const float DRAG_COEFF      = 0.0005f;// km/h per tick per km/h (speed-proportional)
+static const float COAST_DECEL     = 0.12f;  // km/h per tick when throttle=0
+static const int   MIN_CRUISE_KPH  = 5;      // below this, cruise won't engage
+static const float MAX_THROTTLE_DELTA = 2.0f; // Max throttle change per tick
+
+void updateCruiseControl() {
+  if (!keyOn) { 
+    cruiseState = 0; 
+    cruiseActive = false; 
+    return; 
+  }
+
+  if (!cruiseOn) {
+    cruiseState = 0; 
+    cruiseActive = false; 
+    return;
+  }
+
+  if (cruiseSetSpeed <= 0) {
+    cruiseState = 1; 
+    cruiseActive = false; 
+    return;
+  }
+
+  if (vehicleSpeed < MIN_CRUISE_KPH) {
+    cruiseState = 1; 
+    cruiseActive = false; 
+    return;
+  }
+
+  // === ACTIVE ===
+  cruiseState = 2;
+  cruiseActive = true;
+
+  float error = (float)cruiseSetSpeed - (float)vehicleSpeed;
+  float targetThrottle = (float)throttle;
+
+  if (error > CRUISE_DEADBAND) {
+    float delta = CRUISE_KP * (error - CRUISE_DEADBAND);
+    targetThrottle += delta;
+  } 
+  else if (error < -CRUISE_DEADBAND) {
+    float delta = CRUISE_KP * (-CRUISE_DEADBAND - error);
+    targetThrottle -= delta;
+  }
+  // else: within deadband → hold throttle
+
+  // Clamp change per tick for smoothness
+  float throttleDelta = targetThrottle - throttle;
+  throttleDelta = constrain(throttleDelta, -MAX_THROTTLE_DELTA, MAX_THROTTLE_DELTA);
+  throttle = constrain(throttle + throttleDelta, 0.0f, 100.0f);
+
+  // === Vehicle Dynamics ===
+  float v = (float)vehicleSpeed;
+
+  if (throttle > 0) {
+    v += ACCEL_GAIN * throttle;
+    v -= (DRAG_BASE + DRAG_COEFF * v);  // drag always applies
+  } else {
+    v -= COAST_DECEL;
+  }
+
+  v = constrain(v, 0.0f, 110.0f);
+  vehicleSpeed = (int)(v + 0.5f);
+}
+
+// ================ serial print =================
+
+void logTelemetry() {
+  Serial.println("=== Telemetry Log ===");
+  Serial.print("Speed (km/h): "); Serial.println(vehicleSpeed);
+  Serial.print("RPM: "); Serial.println(vehicleRPM);
+  Serial.print("Throttle: "); Serial.print(throttle); Serial.println(" %");
+  Serial.print("Fuel Level: "); Serial.print(fuelLevel); Serial.println(" %");
+  Serial.print("Odometer: "); Serial.print(odometer); Serial.println(" km");
+  Serial.print("Engine Hours: "); Serial.print(engineHours, 3); Serial.println(" h");
+  Serial.print("Fuel Rate: "); Serial.print(fuelRate, 2); Serial.println(" L/h");
+  Serial.print("Instant MPG: "); Serial.print(instantMPG, 1); Serial.println(" mpg");
+  Serial.print("Average MPG: "); Serial.print(averageMPG, 1); Serial.println(" mpg");
+  Serial.print("Trip Fuel: "); Serial.print(tripFuel, 2); Serial.println(" L");
+  Serial.print("Coolant Temp: "); Serial.print(coolantTemp); Serial.println(" °F");
+  Serial.print("Engine Temp: "); Serial.print(engineTemp); Serial.println(" °F");
+  Serial.print("Intake Temp: "); Serial.print(intakeTemp); Serial.println(" °F");
+  Serial.print("Battery Voltage: "); Serial.print(batteryVoltage, 2); Serial.println(" V");
+  Serial.print("Cruise State: "); Serial.println(cruiseState == 0 ? "Off" : cruiseState == 1 ? "Standby" : "Active");
+
+  // === Wi-Fi Info (GIGA-compatible) ===
+  Serial.println("== WiFi Info ==");
+  Serial.print("SSID: "); Serial.println(WiFi.SSID());
+  Serial.print("IP Address: "); Serial.println(WiFi.localIP());
+  Serial.print("RSSI (Signal Strength): "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+
+  // Basic connection diagnostics
+  int stat = WiFi.status();
+  if (stat == WL_CONNECTED) {
+    Serial.println("WiFi Status: Connected");
+  } else if (stat == WL_IDLE_STATUS) {
+    Serial.println("WiFi Status: Idle");
+  } else if (stat == WL_NO_SSID_AVAIL) {
+    Serial.println("WiFi Status: SSID not found");
+  } else if (stat == WL_CONNECT_FAILED) {
+    Serial.println("WiFi Status: Connection failed");
+  } else if (stat == WL_DISCONNECTED) {
+    Serial.println("WiFi Status: Disconnected");
+  } else {
+    Serial.print("WiFi Status: Unknown (");
+    Serial.print(stat);
+    Serial.println(")");
+  }
+  Serial.println("Updated from Web UI - overriding local simulation");
+
+
+  Serial.println("======================");
+}
+
+
+// ================ TIME SIMULATION =================
+void updateTimeMetrics() {
+  static unsigned long prevMillis = 0;
+  unsigned long now = millis();
+  unsigned long elapsed = now - prevMillis;
+  if (elapsed < 100) return;
+  prevMillis = now;
+
+  if (!keyOn) return;
+
+  // === Engine Hours ===
+  engineHours += elapsed * (1.0f / 3600000.0f);
+  engineHours = constrain(engineHours, 0.0f, 99999.9f);
+
+  // === Odometer ===
+  if (vehicleSpeed > 0) {
+    odometer += vehicleSpeed * (elapsed * (1.0f / 3600000.0f));
+    odometer = constrain(odometer, 0, 9999999);
+  }
+
+  // === RPM Simulation ===
+  if (controlSource != 1 || autoSimEnabled) {
+    if (autoMPGEnabled && vehicleSpeed > 0 && throttle > 0) {
+      vehicleRPM = 600 + throttle * 20;
+    } else if (vehicleSpeed == 0) {
+      vehicleRPM = 600;  // Idle
+    }
+  }
+
+  // === Fuel Rate Simulation ===
+  if (autoMPGEnabled) {
+    if (vehicleSpeed == 0 && throttle == 0) {
+      fuelRate = 1.6f;  // IDLE: ~0.42 GPH (13–15L diesel)
+    } else if (throttle > 0) {
+      fuelRate = 0.3f + (throttle / 100.0f) * 1.0f + (vehicleSpeed / 120.0f) * 0.2f;
+    } else {
+      fuelRate = 0.2f;  // Coasting
+    }
+
+    fuelRate = constrain(fuelRate, 0.2f, 2.5f);
+
+    // === Fuel Usage Tracking ===
+    float fuelUsed = fuelRate * (elapsed / 3600000.0f);  // ms → hr
+    const float burnRateAdjustment = 0.5f;  // Slow sim time
+    fuelUsed *= burnRateAdjustment;
+
+    tripFuel += fuelUsed;
+
+    float fuelPercentDrop = (fuelUsed / fuelTankSizeLiters) * 100.0f;
+    fuelLevel = constrain(fuelLevel - fuelPercentDrop, 0.0f, 100.0f);
+
+    float litersRemaining = fuelTankSizeLiters * (fuelLevel / 100.0f);
+
+    // === MPG Calculations ===
+    if (tripFuel > 0.0f) {
+      averageMPG = (odometer / 1.60934f) / (tripFuel * 3.78541f);     // km→mi / L→gal
+      instantMPG = (1.60934f / (fuelRate / 3.78541f));                // L/h → MPG
+    }
+
+    // Clamp to realistic truck range
+    averageMPG = constrain(averageMPG, 4.0f, 10.0f);
+    instantMPG = constrain(instantMPG, 4.0f, 10.0f);
+
+    // === Optional Debug Logging ===
+    Serial.print("FuelRate: "); Serial.print(fuelRate);
+    Serial.print(" L/h | Used: "); Serial.print(fuelUsed, 4);
+    Serial.print(" L | FuelLevel: "); Serial.print(fuelLevel);
+    Serial.print(" % | Liters Left: "); Serial.println(litersRemaining);
+  }
+}
+
+
+// ==================== END NEW FUNCTIONS ====================
+void onCANInterrupt() {
+  canInterruptFlag = true;
+}
+
+void sendAddressClaim() {
+  if (!canReady) return;
+
+  uint8_t name[8];
+
+  // Simulated Detroit Diesel ECM NAME for Freightliner Cascadia
+  // - identityNumber: 0x00420 (arbitrary but plausible)
+  // - manufacturerCode: 0x02D (Detroit Diesel)
+  // - ecuInstance: 0
+  // - functionInstance: 0
+  // - function: 3 (Engine #1)
+  // - vehicleSystem: 0
+  // - vehicleSysInst: 0
+  // - industryGroup: 1 (On-Highway)
+  // - aac: true (arbitrary address capable)
+  buildNameBytes(name, 0x00420, 0x02D, 0, 0, 3, 0, 0, 1, true);
+
+  uint32_t id = j1939Id(PRIORITY_BROADCAST, PGN_ADDRESS_CLAIM, ENGINE_ADDRESS, -1);
+  CAN.sendMsgBuf(id, 1, 8, name);
+  Serial.println("Sent J1939: Address Claim (PGN 0xEE00) with Detroit ECM NAME");
+}
+
+
+
+
+
+// ================ MAIN FUNCTIONS =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  SPI.begin();
+  
+  connectWiFi();
+  wifiServer.begin();
+  
+  Serial.println("Initializing CAN...");
+if (CAN.begin(CAN_SPEED, MCP_16MHz) == CAN_OK) {
+  Serial.println("✅ CAN initialized at 250kbps.");
+  canReady = true;
+         // <-- add this
+} else {
+  Serial.println("⚠️ WARNING: CAN not initialized. Continuing without CAN output.");
+  canReady = false;
+}
+pinMode(CAN_INT_PIN, INPUT);
+attachInterrupt(digitalPinToInterrupt(CAN_INT_PIN), onCANInterrupt, FALLING);
+Serial.println("✅ CAN interrupt attached to D2.");
+
+
+  
+  setupJ1939();
+  if (canReady) {
+  sendAddressClaim();            // announce once
+  startVIN_BAM(vin.c_str());     // kick a single VIN BAM on boot
+}
+
+ lastCANUpdateMillis = millis();
+ lastMetricsUpdateMillis = millis();
+ lastVINSendMillis = millis();
+
+}
+
+void loop() {
+  // Stream any ongoing VIN BAM
+  tickVIN_BAM();
+
+  // Serve web
+  WiFiClient client = wifiServer.available();
+  if (client) handleClient(client);
+
+  unsigned long now = millis();
+
+  // Simulation updates every 100 ms
+  if (now - lastMetricsUpdateMillis >= 100) {
+    updateTimeMetrics();
+    updateCruiseControl();
+    lastMetricsUpdateMillis = now;
+  }
+  // 50 ms CAN: fast dynamics
+  static unsigned long lastEEC1 = 0;
+  if (now - lastEEC1 >= 20) {
+  lastEEC1 = now;
+  if (canReady) sendJ1939_EEC1();  // ✅ PGN 61444: RPM, Load
+}
+
+
+  // 10 Hz CAN: fast dynamics
+  if (now - lastCANUpdateMillis >= 100) {
+    lastCANUpdateMillis = now;
+    if (canReady) {
+      
+      sendJ1939_CCVS();       // speed + CC active + parking brake
+    }
+    logTelemetry();
+  }
+
+  // 1 Hz CAN: slow dynamics
+  static unsigned long last1s = 0;
+  if (now - last1s >= 1000) {
+    last1s = now;
+    if (canReady) {
+      sendJ1939_EH();                 // 0xFEE5 (already correct)
+      sendJ1939_VEHICLE_DISTANCE_LEGACY(); // 0xFEE0
+      sendJ1939_TVD_HR();            // 0xFEC1 (optional but recommended)
+      sendJ1939_FUEL_LEVEL();
+      sendJ1939_ENGINE_TEMP();
+      sendJ1939_BATTERY_VOLTAGE();
+      sendJ1939_FUEL_ECONOMY();
+	   // Optional extras:
+      // sendJ1939_ENGINE_PRESSURE();
+      // sendJ1939_TRANS_TEMP_PRESSURE();
+      // sendJ1939_DTC();
+
+    }
+    logTelemetry();  // ← Always runs even if CAN fails
+    lastCANUpdateMillis = now;
+  }
+  
+ 
+    lastVINSendMillis = now;
+  
+ if (canInterruptFlag) {
+    canInterruptFlag = false;
+    processCANRx();
+  }
+
+  delay(1); // or no delay
+}
+
+// ================ WiFi FUNCTIONS =================
+void connectWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(staSSID, staPass);
+  
+  for (int i = 0; i < 10; i++) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Connected to WiFi.");
+      printWiFiInfo();
+      return;
+    }
+    delay(1000);
+  }
+
+  Serial.println("WiFi connection failed. Creating AP...");
+  WiFi.beginAP(apSSID, apPass);
+  delay(1000);
+  printWiFiInfo();
+}
+
+void printWiFiInfo() {
+  Serial.println("== WiFi Info ==");
+  Serial.print("SSID: "); Serial.println(WiFi.SSID());
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+}
+
+// ================ WEB REQUEST HANDLING =================
+void handleClient(WiFiClient client) {
+  if (!client || !client.connected()) return;
+
+  String requestLine = client.readStringUntil('\r');
+  client.readStringUntil('\n'); // skip newline
+  
+  // Parse method and path
+  int firstSpace = requestLine.indexOf(' ');
+  if (firstSpace == -1) return;
+  
+  String method = requestLine.substring(0, firstSpace);
+  int secondSpace = requestLine.indexOf(' ', firstSpace + 1);
+  String path = requestLine.substring(firstSpace + 1, secondSpace);
+
+  
+  // Read headers
+  int contentLength = 0;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+    }
+    if (line.length() == 0) break; // end of headers
+  }
+
+  // Route handling
+  if (path == "/") {
+  String html = buildHTML();
+  client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n");
+  client.print(html);
+  client.stop();                   // <-- add this
+  return;
+}
+
+  else if (method == "GET" && path == "/data") {
+    handleDataRequest(client);
+  }
+  else if (method == "POST" && path == "/update") {
+  String body = "";
+  int readLength = 0;
+  unsigned long startTime = millis();
+
+  // Safely read the full POST body
+  while (readLength < contentLength && (millis() - startTime < 1000)) {
+    while (client.available()) {
+      char c = client.read();
+      body += c;
+      readLength++;
+      if (readLength >= contentLength) break;
+    }
+  }
+
+  if (readLength < contentLength) {
+    Serial.println("⚠️ Incomplete POST body");
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: text/plain");
+    client.println("Connection: close");
+    client.println();
+    client.println("Error: Incomplete POST body received.");
+    return;
+  }
+
+  // Deserialize JSON
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    Serial.print("⚠️ JSON Error: ");
+    Serial.println(error.c_str());
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: text/plain");
+    client.println("Connection: close");
+    client.println();
+    client.println("JSON parse error: " + String(error.c_str()));
+    return;
+  }
+	else {
+      // Update vehicle parameters from JSON with proper types
+      keyOn = doc["keyOn"].as<bool>();
+      cruiseOn = doc["cruiseOn"].as<bool>();
+	  
+	  // 1) Flags first
+      if (doc.containsKey("autoSim")) {
+        autoSimEnabled = doc["autoSim"].as<bool>();
+      }
+
+       // 2) What fields did this POST include?
+       const bool hasOdo   = doc.containsKey("odometer");
+       const bool hasHours = doc.containsKey("engineHours");
+
+      // 3) Apply speed only if it's a true speed edit
+        if (doc.containsKey("speed")) {
+         if (autoSimEnabled || (!hasOdo && !hasHours)) {
+            int s = doc["speed"].as<int>();
+          vehicleSpeed = constrain(s, 0, 112);
+  }
+}
+
+// 4) Manual odometer only when AutoSim is OFF
+if (hasOdo && !autoSimEnabled) {
+  odometer = constrain(doc["odometer"].as<float>(), 0, 9999999);
+}
+
+// 5) Allow manual hours edits any time
+if (hasHours) {
+  engineHours = constrain(doc["engineHours"].as<float>(), 0, 99999.9);
+}
+
+
+      if (doc.containsKey("autoMPG")) {
+         autoMPGEnabled = doc["autoMPG"].as<bool>();
+       }
+      
+      
+      if (doc.containsKey("cruiseSetSpeed")) {
+        cruiseSetSpeed = doc["cruiseSetSpeed"].as<int>();
+        cruiseSetSpeed = constrain(cruiseSetSpeed, 0, 110);
+      }
+      
+      if (doc.containsKey("rpm")) {
+        vehicleRPM = doc["rpm"].as<int>();
+        vehicleRPM = constrain(vehicleRPM, 0, 3500);
+      }
+      
+      if (doc.containsKey("fuel")) {
+        fuelLevel = doc["fuel"].as<int>();
+        fuelLevel = constrain(fuelLevel, 0, 100);
+      }
+      
+      if (doc.containsKey("throttle")) {
+        throttle = doc["throttle"].as<int>();
+        throttle = constrain(throttle, 0, 100);
+      }
+      
+      if (doc.containsKey("engineLoad")) {
+        engineLoad = doc["engineLoad"].as<int>();
+        engineLoad = constrain(engineLoad, 0, 100);
+      }
+      
+      if (doc.containsKey("coolantTemp")) {
+        coolantTemp = doc["coolantTemp"].as<int>();
+        coolantTemp = constrain(coolantTemp, 160, 240);
+      }
+      
+      if (doc.containsKey("engineTemp")) {
+        engineTemp = doc["engineTemp"].as<int>();
+        engineTemp = constrain(engineTemp, 160, 250);
+      }
+      
+      if (doc.containsKey("intakeTemp")) {
+        intakeTemp = doc["intakeTemp"].as<int>();
+        intakeTemp = constrain(intakeTemp, 40, 160);
+      }
+      
+      if (doc.containsKey("batteryVoltage")) {
+        batteryVoltage = doc["batteryVoltage"].as<float>();
+        batteryVoltage = constrain(batteryVoltage, 10.0, 15.0);
+      }
+      
+    
+      if (doc.containsKey("vin")) {
+        String newVIN = doc["vin"].as<String>();
+        if (newVIN.length() == 17) vin = newVIN;
+      }
+      
+	  if (doc.containsKey("fuelRate")) {
+        fuelRate = doc["fuelRate"].as<float>();
+        fuelRate = constrain(fuelRate, 0.0, 500.0);
+      }
+
+      if (doc.containsKey("instantMPG")) {
+         instantMPG = doc["instantMPG"].as<float>();
+         instantMPG = constrain(instantMPG, 0.0, 200.0);
+      }
+
+      if (doc.containsKey("averageMPG")) {
+         averageMPG = doc["averageMPG"].as<float>();
+         averageMPG = constrain(averageMPG, 0.0, 200.0);
+      }
+
+      if (doc.containsKey("tripFuel")) {
+         tripFuel = doc["tripFuel"].as<float>();
+         tripFuel = constrain(tripFuel, 0.0, 500.0);
+      }
+
+	  
+       controlSource = 1;
+  Serial.println("✅ Update from Web UI applied successfully.");
+
+  // Respond to client
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.println("{\"status\":\"updated\"}");
+}
+  
+  client.stop();
+}
+}
+
+void handleDataRequest(WiFiClient& client) {
+  StaticJsonDocument<512> doc;
+  
+  // Basic vehicle state
+  doc["keyOn"] = keyOn;
+  doc["cruiseOn"] = cruiseOn;
+  doc["autoSim"] = autoSimEnabled;
+  doc["autoMPG"] = autoMPGEnabled;
+  doc["cruiseSetSpeed"] = cruiseSetSpeed;
+  doc["cruiseState"] = cruiseState;
+  doc["cruiseActive"] = cruiseActive;
+  doc["speed"] = vehicleSpeed;
+  doc["rpm"] = vehicleRPM;
+  doc["fuel"] = fuelLevel;
+  doc["litersRemaining"] = fuelTankSizeLiters * (fuelLevel / 100.0f);
+  doc["throttle"] = throttle;
+  doc["engineLoad"] = engineLoad;
+  doc["coolantTemp"] = coolantTemp;
+  doc["engineTemp"] = engineTemp;
+  doc["intakeTemp"] = intakeTemp;
+  doc["batteryVoltage"] = batteryVoltage;
+  doc["fuelRate"] = fuelRate;
+  doc["instantMPG"] = instantMPG;
+  doc["averageMPG"] = averageMPG;
+  doc["tripFuel"] = tripFuel;
+  doc["odometer"] = odometer;
+  doc["engineHours"] = engineHours;
+  doc["source"] = controlSource == 0 ? "Hardware" : "Web";
+  doc["vin"] = vin;
+  
+  // Network information
+  JsonObject wifi = doc.createNestedObject("wifi");
+  wifi["ssid"] = WiFi.SSID();
+  wifi["ip"] = WiFi.localIP().toString();
+  wifi["rssi"] = WiFi.RSSI();
+  
+  String json;
+  serializeJson(doc, json);
+  
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.println(json);
+  client.stop();
+}
+
+// ================ WEB UI HTML =================
+String buildHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Vehicle Simulator</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; padding: 20px; }
+    h1 { color: #0f0; } .section { margin-bottom: 20px; }
+    label { display: block; margin: 5px 0; }
+    input[type="checkbox"] { margin-right: 10px; }
+    input[type="range"], input[type="number"] { width: 100%; }
+    .sim-value { font-weight: bold; color: #0f0; }
+    .pgn { color: #888; font-size: 0.8em; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Vehicle Simulator</h1>
+  
+  <div class="grid">
+    <div class="section">
+      <h3>Vehicle Controls</h3>
+      
+      <label><input type="checkbox" id="keyOn"> Ignition Key On</label>
+      <label><input type="checkbox" id="cruiseOn"> Cruise Control</label>
+      <label><input type="checkbox" id="autoSim" checked> Auto Simulation (Speed, Odo, RPM)</label>
+      <label><input type="checkbox" id="autoMPG" checked> Auto Fuel + MPG Calculations</label>
+
+	  
+      <label>Speed (km/h): 
+        <input type="range" id="speed" min="0" max="112" value="0">
+        <span class="pgn">PGN:</span>
+      </label>
+      
+      <label>Cruise Set Speed (km/h): 
+        <input type="number" id="cruiseSetSpeed" min="0" max="110" step="1">
+        <span class="sim-value" id="cssVal">--</span> km/h
+      </label>
+      
+      <label>Throttle (%): 
+        <input type="range" id="throttle" min="0" max="100" value="0">
+        <span class="pgn">PGN: </span>
+      </label>
+	  
+	  <label>Engine RPM:
+        <input type="range" id="rpm" min="0" max="3500" value="0">
+        <span class="pgn">PGN:</span>
+      </label>
+
+      <label>Engine Load (%): 
+        <input type="range" id="engineLoad" min="0" max="100" value="0">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Fuel Level (%): 
+        <input type="range" id="fuel" min="0" max="100" value="100">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Coolant Temp (°F): 
+        <input type="range" id="coolantTemp" min="160" max="240" value="190">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Engine Temp (°F): 
+        <input type="range" id="engineTemp" min="160" max="250" value="200">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Intake Temp (°F): 
+        <input type="range" id="intakeTemp" min="40" max="160" value="90">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Battery Voltage (V): 
+        <input type="range" id="batteryVoltage" step="0.1" min="10.0" max="15.0" value="13.8">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>VIN (17 chars): 
+        <input type="text" id="vin" maxlength="17" value="3AKJHPDV3NSMZ5468">
+      </label>
+      
+      <label>Odometer (km): 
+        <input type="number" id="odometer" min="0" max="9999999" step="0.1">
+        <span class="pgn">PGN: </span>
+      </label>
+      
+      <label>Engine Hours: 
+        <input type="number" id="engineHours" min="0" max="99999" step="0.01">
+        <span class="pgn">PGN: </span>
+      </label>
+	  
+	  <label>Fuel Rate (L/h): 
+       <input type="number" id="fuelRate" min="0" max="500" step="0.1">
+       <span class="pgn">PGN: </span>
+      </label>
+
+      <label>Instant MPG: 
+        <input type="number" id="instantMPG" min="0" max="200" step="0.1">
+      </label>
+
+      <label>Average MPG: 
+       <input type="number" id="averageMPG" min="0" max="200" step="0.1">
+      </label>
+
+      <label>Trip Fuel (L): 
+       <input type="number" id="tripFuel" min="0" max="500" step="0.1">
+      </label>
+
+	  
+    </div>
+    
+    <div class="section">
+      <h3>Simulation Output</h3>
+      
+      <p>Vehicle Speed: <span class="sim-value" id="simSpeed">--</span> km/h</p>
+      <p>Engine RPM: <span class="sim-value" id="simRPM">--</span> RPM</p>
+      <p>Throttle Position: <span class="sim-value" id="simThrottle">--</span>%</p>
+      <p>Engine Load: <span class="sim-value" id="simLoad">--</span>%</p>
+      <p>Fuel Level: <span class="sim-value" id="simFuel">--</span>%</p>
+      <p>Coolant Temp: <span class="sim-value" id="simCoolant">--</span> °F</p>
+      <p>Engine Temp: <span class="sim-value" id="simEngTemp">--</span> °F</p>
+      <p>Intake Temp: <span class="sim-value" id="simIntake">--</span> °F</p>
+      <p>Battery Voltage: <span class="sim-value" id="simVoltage">--</span> V</p>
+      <p>Odometer: <span class="sim-value" id="simOdo">--</span> km</p>
+      <p>Engine Hours: <span class="sim-value" id="simHours">--</span> hrs</p>
+      <p>Fuel Rate: <span class="sim-value" id="simFuelRate">--</span> L/h</p>
+      <p>Instant MPG: <span class="sim-value" id="simMPG">--</span> mpg</p>
+      <p>Average MPG: <span class="sim-value" id="simAvgMPG">--</span> mpg</p>
+      <p>Trip Fuel: <span class="sim-value" id="simTripFuel">--</span> L</p>
+      <p>Cruise Control State: <span class="sim-value" id="simCruiseState">--</span></p>
+      <p>Cruise Set Speed: <span class="sim-value" id="simCruiseSetSpeed">--</span> km/h</p>
+      <p>Control Source: <span class="sim-value" id="controlSource">--</span></p>
+      <p>WiFi: <span id="wifiInfo">--</span></p>
+    </div>
+  </div>
+  
+  <script>
+    let lastInteraction = Date.now();
+    let updateTimeout = null;
+    
+    function updateFromUI() {
+      lastInteraction = Date.now();
+      const payload = {
+        keyOn: document.getElementById("keyOn").checked,
+        cruiseOn: document.getElementById("cruiseOn").checked,
+		autoSim: document.getElementById("autoSim").checked,
+        autoMPG: document.getElementById("autoMPG").checked,
+        speed: parseInt(document.getElementById("speed").value),
+        cruiseSetSpeed: parseInt(document.getElementById("cruiseSetSpeed").value),
+        rpm: parseInt(document.getElementById("rpm").value),
+        fuel: parseInt(document.getElementById("fuel").value),
+        throttle: parseInt(document.getElementById("throttle").value),
+        engineLoad: parseInt(document.getElementById("engineLoad").value),
+        coolantTemp: parseInt(document.getElementById("coolantTemp").value),
+        engineTemp: parseInt(document.getElementById("engineTemp").value),
+        intakeTemp: parseInt(document.getElementById("intakeTemp").value),
+        batteryVoltage: parseFloat(document.getElementById("batteryVoltage").value),
+        odometer:  parseFloat(document.getElementById("odometer").value),
+        engineHours: parseFloat(document.getElementById("engineHours").value),
+        vin: document.getElementById("vin").value,
+		fuelRate: parseFloat(document.getElementById("fuelRate").value),
+        instantMPG: parseFloat(document.getElementById("instantMPG").value),
+        averageMPG: parseFloat(document.getElementById("averageMPG").value),
+        tripFuel: parseFloat(document.getElementById("tripFuel").value),
+        };
+      
+      // Update display values
+      document.getElementById("simSpeed").textContent = payload.speed;
+      document.getElementById("cssVal").textContent = payload.cruiseSetSpeed;
+      document.getElementById("simRPM").textContent = payload.rpm;
+      document.getElementById("simFuel").textContent = payload.fuel;
+      document.getElementById("simThrottle").textContent = payload.throttle;
+      document.getElementById("simLoad").textContent = payload.engineLoad;
+      document.getElementById("simCoolant").textContent = payload.coolantTemp;
+      document.getElementById("simEngTemp").textContent = payload.engineTemp;
+      document.getElementById("simIntake").textContent = payload.intakeTemp;
+      document.getElementById("simVoltage").textContent = payload.batteryVoltage.toFixed(1);
+      document.getElementById("simOdo").textContent = payload.odometer.toFixed(2);
+      document.getElementById("simHours").textContent = payload.engineHours.toFixed(2);
+      
+      // Send to Arduino
+      clearTimeout(updateTimeout);
+  updateTimeout = setTimeout(() => {
+    fetch("/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(() => {
+      lastInteraction = Date.now();  // ✅ Reset after POST succeeds
+    });
+  }, 100); // Optional: delay can be 100–250 ms
+}
+    
+    function pollState() {
+      fetch("/data")
+        .then(response => response.json())
+        .then(data => {
+          // Update UI values
+          document.getElementById("keyOn").checked = data.keyOn;
+          document.getElementById("cruiseOn").checked = data.cruiseOn;
+		  document.getElementById("autoSim").checked = data.autoSim;
+          document.getElementById("autoMPG").checked = data.autoMPG;
+          document.getElementById("speed").value = data.speed;
+          document.getElementById("cruiseSetSpeed").value = data.cruiseSetSpeed;
+          document.getElementById("rpm").value = data.rpm;
+          document.getElementById("fuel").value = data.fuel;
+          document.getElementById("throttle").value = data.throttle;
+          document.getElementById("engineLoad").value = data.engineLoad;
+          document.getElementById("coolantTemp").value = data.coolantTemp;
+          document.getElementById("engineTemp").value = data.engineTemp;
+          document.getElementById("intakeTemp").value = data.intakeTemp;
+          document.getElementById("batteryVoltage").value = data.batteryVoltage.toFixed(1);
+          document.getElementById("odometer").value = data.odometer;
+          document.getElementById("engineHours").value = data.engineHours.toFixed(2);
+          
+          // Display values
+          document.getElementById("simCruiseState").textContent = data.cruiseState === 0 ? "Off" : data.cruiseState === 1 ? "Standby" : "Active";
+          document.getElementById("simCruiseSetSpeed").textContent = data.cruiseSetSpeed;
+          document.getElementById("simFuelRate").textContent = data.fuelRate.toFixed(1);
+          document.getElementById("simMPG").textContent = data.instantMPG.toFixed(1);
+          document.getElementById("simAvgMPG").textContent = data.averageMPG.toFixed(1);
+          document.getElementById("simTripFuel").textContent = data.tripFuel.toFixed(1);
+          document.getElementById("controlSource").textContent = data.source;
+          document.getElementById("wifiInfo").textContent = data.wifi.ssid + " | " + data.wifi.ip + " | " + data.wifi.rssi + " dBm";
+        });
+    }
+    
+    function attachListeners() {
+      ["keyOn","cruiseOn","autoSim","autoMPG","speed","cruiseSetSpeed","rpm","fuel","throttle","engineLoad","coolantTemp","engineTemp","intakeTemp","batteryVoltage","odometer","engineHours","vin","fuelRate","instantMPG","averageMPG","tripFuel"  ].forEach(id => {
+        const el = document.getElementById(id);
+        el.addEventListener("input", () => {
+          clearTimeout(updateTimeout);
+          updateTimeout = setTimeout(updateFromUI, 200);
+        });
+        el.addEventListener("change", updateFromUI);
+      });
+    }
+    
+    attachListeners();
+	
+    setInterval(() => {
+  const now = Date.now();
+  if (now - lastInteraction > 1500) {
+    pollState();  // Only poll if no recent UI activity
+  }
+}, 1000);
+
+  </script>
+</body>
+</html>
+)rawliteral";
+}
+
+
