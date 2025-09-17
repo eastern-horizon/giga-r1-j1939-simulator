@@ -37,6 +37,62 @@ More details: see `docs/OVERVIEW.md` and `docs/SETUP.md`.
 
 ---
 
+
+# v1.3 — Fuel realism, LFE, TP.BAM fix, distance PGNs, persistence
+
+## Highlights
+
+* **More realistic fuel model** with DFCO, idle, linear & aero terms, and UI-safe clamps. Also fixes the fuel-level slider behavior by using a single “source of truth” for liters remaining. &#x20;
+* **LFE (Fuel Economy / PGN 65266)** now transmitted with correct SPNs and scaling; hides instant MPG at low speeds to avoid noisy values.&#x20;
+* **VIN over TP.BAM**: reserved byte in CM frame corrected to **0xFF** (BAM), not “7”. This aligns with J1939-21. &#x20;
+* **Vehicle distance**: supports both legacy Vehicle Distance (PGN 65217) and **Total/Trip Vehicle Distance High Resolution** (PGN 65248). &#x20;
+* **Persistent odometer & hours**: values are loaded at boot and continuously synced back to KV; precise integer counters (meters/seconds) drive the floats so they never drift.  &#x20;
+
+## Added
+
+* **PGN 65266 (LFE)** builder with SPN-correct mph→MPG conversion, and DFCO behavior carrying through to instant MPG (shows NA/steady when appropriate).&#x20;
+* **High-resolution distance (PGN 65248)** alongside the legacy odometer PGN for broader tool compatibility.&#x20;
+
+## Changed
+
+* **Fuel-use & fuel-level**: model runs entirely in **L/h**, integrates consumption per tick, and uses a single global `LitersRemaining` to derive `% fuelLevel` (fixes slider disagreements & race conditions).&#x20;
+* **Instant/Average MPG display**: clamps for UI sanity and hides instant MPG when `vehicleSpeed <= 5 mph`.&#x20;
+* **TP.BAM CM byte 5 (reserved)** now `0xFF` for VIN BAM; also standardized the TP.CM/TP.DT identifiers via `j1939Id(...)`.  &#x20;
+* **PGN & SPN correctness pass** (selection):
+
+  * **Fuel Level 1** uses PGN **0xFEFC (65276)** with proper 0.4%/bit mapping and byte positions.&#x20;
+  * **Vehicle Electrical Power (VEP / 65271)** battery potential **SPN 168** placed at bytes 5–6 with 0.05 V/bit.&#x20;
+  * **Engine Temp / ET1 (65262)** encodings clarified (Kelvin-based oil, −40 °C offset where applicable).&#x20;
+  * **CCVS (Cruise/Vehicle Speed) flags** and SPN 586 packed per spec. &#x20;
+
+## Fixed
+
+* **Fuel slider** sticking at 100% when toggling Auto MPG: resolved by eliminating local copies and driving `%` from global liters remaining.&#x20;
+* **VIN BAM** CM\[4] incorrect value (`7`) in older snapshots—now normalized to `0xFF` everywhere we emit or schedule BAM.&#x20;
+
+## Internals / Stability
+
+* **Precise counters** (`ODO_METERS`, `ENG_SECONDS`) tick in whole units and backfill the user-visible floats during each update cycle. This keeps legacy math and adds accuracy. &#x20;
+* **CAN init & interrupt**: explicit flagging and D2 interrupt attach logged at startup for easier bring-up.&#x20;
+* **VIN BAM scheduling**: simple state machine with pacing gap to avoid floods on slow busses. &#x20;
+
+## Tunables (fuel model defaults)
+
+Idle 2.2 L/h; base 3.0 L/h; linear 0.50 L/h per mph; aero 0.0025·mph²; DFCO threshold 8 mph. Tweak in code comments if you need a different tractor/trailer profile.&#x20;
+
+## Known Issues / Notes
+
+* Instant MPG is suppressed below \~5 mph by design to prevent division noise; tools expecting a number at 0–5 mph may see last good value or clamp.&#x20;
+* If your downstream expects only one distance PGN, you may disable either legacy or HR sender in `sendJ1939_ODOMETER()`.&#x20;
+
+## Upgrade Guide
+
+1. Flash v1.3. On first boot we **load** persisted odo/hours and **seed** precise counters; from then on, the counters are the source of truth and we keep KV in sync automatically. &#x20;
+2. Verify CAN @ 250 kbps initializes (console shows ✅) and that VIN is broadcast once via BAM at startup. &#x20;
+3. (Optional) Adjust fuel model constants to match your platform’s burn rates.&#x20;
+
+
+
 ## v1.20 — Auto Mode & Large-Number Counters Fix
 
 
