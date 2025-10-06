@@ -36,6 +36,11 @@ More details: see `docs/OVERVIEW.md` and `docs/SETUP.md`.
 
 
 ---
+# v1.3 — quality of life, dual speed control
+
+## Highlights
+
+v1.4 — Dual Speed Control. You can now type an exact speed or use the slider; both stay perfectly in sync.
 
 
 # v1.3 — Fuel realism, LFE, TP.BAM fix, distance PGNs, persistence
